@@ -1,93 +1,84 @@
 import streamlit as st
 import pandas as pd
 from step5_signal_logic import get_current_recommendations
-from datetime import datetime
+from live_data_mt5 import get_live_data
+from datetime import datetime, time
 import pytz
 from streamlit_autorefresh import st_autorefresh
+import MetaTrader5 as mt5
 
-# -------------------------------------------------
-# Page config
-# -------------------------------------------------
 st.set_page_config(page_title="PipDynamics", layout="wide")
 st.title("📈 PipDynamics – Forex Market Recommendations")
 
-# -------------------------------------------------
-# MOD 9️⃣ Auto refresh (5 minutes)
-# -------------------------------------------------
 st_autorefresh(interval=300000, key="auto_refresh")
 
-# -------------------------------------------------
-# MOD 5️⃣ Last updated time (IST)
-# -------------------------------------------------
+# ---------------------------------------------
+# Market Status
+# ---------------------------------------------
 ist = pytz.timezone("Asia/Kolkata")
-last_updated = datetime.now(ist).strftime("%d %b %Y – %I:%M %p IST")
-st.caption(f"🕒 Last updated: {last_updated}")
+now = datetime.now(ist).time()
+market_status = "🟢 OPEN" if time(5,30) <= now <= time(22,30) else "🔴 CLOSED"
+st.caption(f"Market Status: **{market_status}**")
 
-# -------------------------------------------------
-# Load data
-# -------------------------------------------------
+# ---------------------------------------------
+# Load Past Data
+# ---------------------------------------------
 df = pd.read_csv("OP/final_trading_signals.csv")
 
-# Get recommendations
-signals = get_current_recommendations(df)
+# ---------------------------------------------
+# Pair + Timeframe
+# ---------------------------------------------
+col1, col2 = st.columns(2)
 
-# Create table
+with col1:
+    selected_pair = st.selectbox("Currency Pair", df["pair"].unique())
+
+with col2:
+    tf_label = st.selectbox("Timeframe", ["M5", "M15", "H1"])
+
+TF_MAP = {
+    "M5": mt5.TIMEFRAME_M5,
+    "M15": mt5.TIMEFRAME_M15,
+    "H1": mt5.TIMEFRAME_H1
+}
+
+timeframe = TF_MAP[tf_label]
+
+# ---------------------------------------------
+# Recommendations (PAST + LIVE)
+# ---------------------------------------------
+signals = get_current_recommendations(df, timeframe)
 table = pd.DataFrame(signals)
+row = table[table["pair"] == selected_pair].iloc[0]
 
-# -------------------------------------------------
-# MOD 1️⃣ Signal Strength
-# -------------------------------------------------
-def signal_strength(conf):
-    if conf >= 0.75:
-        return "🔥 Strong"
-    elif conf >= 0.50:
-        return "⚠️ Medium"
-    else:
-        return "💤 Weak"
+# ---------------------------------------------
+# LIVE PRICE
+# ---------------------------------------------
+symbol = selected_pair.replace("/", "")
+live_df = get_live_data(symbol, timeframe=timeframe, bars=50)
 
-table["strength"] = table["confidence"].apply(signal_strength)
+last_close = live_df.iloc[-1]["close"]
+prev_close = live_df.iloc[-2]["close"]
+arrow = "⬆️" if last_close > prev_close else "⬇️"
 
-# Format confidence
-table["confidence"] = table["confidence"].map(lambda x: f"{x:.2f}")
+# ---------------------------------------------
+# Strength
+# ---------------------------------------------
+def strength(conf):
+    if conf >= 0.75: return "🔥 Strong"
+    if conf >= 0.50: return "⚠️ Medium"
+    return "💤 Weak"
 
-# -------------------------------------------------
-# 🎨 Signal coloring
-# -------------------------------------------------
-def color_signal(val):
-    if val == "BUY":
-        return "background-color: #c6f6d5; color: black;"
-    elif val == "SELL":
-        return "background-color: #fed7d7; color: black;"
-    else:  # HOLD
-        return "background-color: #fefcbf; color: black;"
-
-# -------------------------------------------------
-# Main table display
-# -------------------------------------------------
-st.subheader("📊 Market Recommendations")
-
-st.dataframe(
-    table[["pair", "signal", "strength", "confidence"]]
-        .style.applymap(color_signal, subset=["signal"]),
-    use_container_width=True
-)
-
-# -------------------------------------------------
-# MOD 8️⃣ Pair Detail View
-# -------------------------------------------------
+# ---------------------------------------------
+# DISPLAY
+# ---------------------------------------------
 st.divider()
-st.subheader("🔍 Pair Indicator Details")
+st.subheader(f"📌 {selected_pair} Recommendation")
 
-selected_pair = st.selectbox(
-    "Select a currency pair",
-    table["pair"].unique()
-)
+c1, c2, c3 = st.columns(3)
+c1.metric("Signal", row["signal"])
+c2.metric("Strength", strength(row["confidence"]))
+c3.metric("Live Price", f"{round(last_close,5)} {arrow}")
 
-pair_df = df[df["pair"] == selected_pair].iloc[-1]
+# streamlit run Code/app.py
 
-col1, col2, col3, col4 = st.columns(4)
-
-col1.metric("RSI", pair_df["RSI"])
-col2.metric("BOS", pair_df["BOS"])
-col3.metric("Order Block", pair_df["OrderBlock"])
-col4.metric("Signal", pair_df["Signal"])

@@ -1,84 +1,67 @@
+from live_data_mt5 import get_live_data
 import os
 import pandas as pd
 
-# -------------------------------------------------
-# Project root
-# -------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-# -------------------------------------------------
-# Load order block data
-# -------------------------------------------------
 input_path = os.path.join(BASE_DIR, "OP", "data_with_order_blocks.csv")
 df = pd.read_csv(input_path)
 
-# -------------------------------------------------
-# Signal Logic (BUY / SELL / HOLD)
-# -------------------------------------------------
-df["Signal"] = 0  # 1 = Buy, -1 = Sell, 0 = Hold
+# ---------------------------------------------
+# LIVE TREND (FIXED)
+# ---------------------------------------------
+def get_live_trend(pair, timeframe):
+    symbol = pair.replace("/", "")
 
-for i in range(len(df)):
-    # BUY
-    if (
-        df.loc[i, "BOS"] == 1 and
-        df.loc[i, "OrderBlock"] == 1 and
-        df.loc[i, "Dist_Liq_Low"] < df["Dist_Liq_Low"].quantile(0.25) and
-        df.loc[i, "RSI"] < 70
-    ):
-        df.loc[i, "Signal"] = 1
+    live_df = get_live_data(symbol, timeframe=timeframe, bars=20)
 
-    # SELL
-    elif (
-        df.loc[i, "BOS"] == -1 and
-        df.loc[i, "OrderBlock"] == -1 and
-        df.loc[i, "Dist_Liq_High"] < df["Dist_Liq_High"].quantile(0.25) and
-        df.loc[i, "RSI"] > 30
-    ):
-        df.loc[i, "Signal"] = -1
+    if live_df.empty or len(live_df) < 2:
+        return "FLAT"
 
-# -------------------------------------------------
-# Save output
-# -------------------------------------------------
-output_path = os.path.join(BASE_DIR, "OP", "final_trading_signals.csv")
-df.to_csv(output_path, index=False)
+    last_close = live_df.iloc[-1]["close"]
+    prev_close = live_df.iloc[-2]["close"]
 
-print("Step 5 completed ✅ Trading signals generated")
-print("Saved at:", output_path)
-print("\nSignal distribution:")
-print(df["Signal"].value_counts())
+    if last_close > prev_close:
+        return "UP"
+    elif last_close < prev_close:
+        return "DOWN"
+    else:
+        return "FLAT"
 
-# -------------------------------------------------
-# CURRENT RECOMMENDATIONS (Version 2)
-# -------------------------------------------------
-def get_current_recommendations(df):
+
+# ---------------------------------------------
+# FINAL RECOMMENDATIONS
+# ---------------------------------------------
+def get_current_recommendations(df, timeframe=None):
     results = []
 
     for pair in df["pair"].unique():
         pair_df = df[df["pair"] == pair]
+        last_row = pair_df.iloc[-1]
 
-        # ---- SIGNAL ----
-        last_signal = pair_df.iloc[-1]["Signal"]
-
-        if last_signal == 1:
+        # ---- PAST SIGNAL ----
+        if last_row["Signal"] == 1:
             signal = "BUY"
-        elif last_signal == -1:
+            confidence = 0.55
+        elif last_row["Signal"] == -1:
             signal = "SELL"
+            confidence = 0.55
         else:
             signal = "HOLD"
+            confidence = 0.40
 
-        # ---- CONFIDENCE (dynamic) ----
-        conditions = 0
+        # ---- LIVE CONFIRMATION ----
+        if timeframe is not None:
+            live_trend = get_live_trend(pair, timeframe)
 
-        if pair_df.iloc[-1]["BOS"] != 0:
-            conditions += 1
-        if pair_df.iloc[-1]["OrderBlock"] != 0:
-            conditions += 1
-        if 30 < pair_df.iloc[-1]["RSI"] < 70:
-            conditions += 1
-        if pair_df.iloc[-1]["Dist_Liq_Low"] < pair_df["Dist_Liq_Low"].quantile(0.25):
-            conditions += 1
+            if signal == "BUY" and live_trend == "UP":
+                confidence += 0.25
+            elif signal == "SELL" and live_trend == "DOWN":
+                confidence += 0.25
+            elif signal == "HOLD" and live_trend in ["UP", "DOWN"]:
+                signal = "BUY" if live_trend == "UP" else "SELL"
+                confidence += 0.30
 
-        confidence = round(conditions / 4, 2)
+        confidence = min(round(confidence, 2), 0.99)
 
         results.append({
             "pair": pair,
