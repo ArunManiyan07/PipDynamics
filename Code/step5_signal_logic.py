@@ -1,101 +1,132 @@
-from live_data_mt5 import get_live_data
-import os
 import pandas as pd
 import joblib
+import os
+import numpy as np
 
-# -------------------------------------------------
-# Paths
-# -------------------------------------------------
+from live_data_mt5 import get_live_data
+
+# =================================================
+# PATHS
+# =================================================
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_PATH = os.path.join(BASE_DIR, "OP", "data_with_order_blocks.csv")
 MODEL_PATH = os.path.join(BASE_DIR, "models", "rf_h1_directional_model.pkl")
 
-df = pd.read_csv(DATA_PATH)
+# =================================================
+# LOAD MODEL
+# =================================================
 ml_model = joblib.load(MODEL_PATH)
 
-# -------------------------------------------------
-# ML PREDICTION (FIXED)
-# -------------------------------------------------
-def ml_predict_direction(row):
+# =================================================
+# INDICATORS
+# =================================================
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    # EMA
+    df["EMA"] = df["close"].ewm(span=20, adjust=False).mean()
+
+    # RSI
+    delta = df["close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
+
+    rs = avg_gain / (avg_loss + 1e-9)
+    df["RSI"] = 100 - (100 / (1 + rs))
+
+    return df
+
+# =================================================
+# ML PROBABILITY (CONFIDENCE ONLY)
+# =================================================
+def get_ml_bias(row):
     X = pd.DataFrame([{
         "EMA": row["EMA"],
-        "RSI": row["RSI"],
-        "BOS": row["BOS"]
+        "RSI": row["RSI"]
     }])
-    return ml_model.predict(X)[0]
 
-# -------------------------------------------------
-# LIVE TREND (UNCHANGED)
-# -------------------------------------------------
-def get_live_trend(pair, timeframe):
-    symbol = pair.replace("/", "")
-    live_df = get_live_data(symbol, timeframe=timeframe, bars=20)
+    try:
+        probs = ml_model.predict_proba(X)[0]
+        buy_prob = float(probs[1])
+        sell_prob = float(probs[0])
+        return buy_prob - sell_prob   # bias only
+    except Exception:
+        return 0.0
 
-    if live_df.empty or len(live_df) < 2:
+# =================================================
+# STRONGER TREND (PRICE ACTION)
+# =================================================
+def get_trend(df: pd.DataFrame) -> str:
+    if len(df) < 50:
         return "FLAT"
 
-    last_close = live_df.iloc[-1]["close"]
-    prev_close = live_df.iloc[-2]["close"]
+    recent_high = df["high"].iloc[-20:].max()
+    recent_low = df["low"].iloc[-20:].min()
 
-    if last_close > prev_close:
+    if df["close"].iloc[-1] > recent_high * 0.998:
         return "UP"
-    elif last_close < prev_close:
+    if df["close"].iloc[-1] < recent_low * 1.002:
         return "DOWN"
+    return "FLAT"
+
+# =================================================
+# 🔥 FINAL RECOMMENDATION ENGINE (GUARANTEED DISTRIBUTION)
+# =================================================
+def get_recommendation_for_pair(pair: str, timeframe: str = "M15"):
+
+    df = get_live_data(pair, timeframe=timeframe, bars=300)
+    if df is None or len(df) < 150:
+        return {"signal": "NO DATA", "confidence": 0, "reason": "Insufficient data"}
+
+    df = add_indicators(df)
+    last = df.iloc[-1]
+
+    trend = get_trend(df)
+    rsi = last["RSI"]
+    ml_bias = get_ml_bias(last)
+
+    # =================================================
+    # 1️⃣ RULE-BASED DIRECTION (PRIMARY)
+    # =================================================
+    if trend == "UP" and rsi < 70:
+        signal = "BUY"
+        confidence = 65 + (70 - rsi) * 0.5
+    elif trend == "DOWN" and rsi > 30:
+        signal = "SELL"
+        confidence = 65 + (rsi - 30) * 0.5
     else:
-        return "FLAT"
+        return {
+            "signal": "HOLD",
+            "confidence": 50,
+            "reason": "Market ranging / no structure"
+        }
 
-# -------------------------------------------------
-# FINAL RECOMMENDATIONS (H1 ML + SMC FILTER)
-# -------------------------------------------------
-def get_current_recommendations(df, timeframe=None):
-    results = []
+    # =================================================
+    # 2️⃣ ML CONFIDENCE ADJUSTMENT (NOT DIRECTION)
+    # =================================================
+    if signal == "BUY" and ml_bias > 0:
+        confidence += 8
+    elif signal == "SELL" and ml_bias < 0:
+        confidence += 8
+    else:
+        confidence -= 5
 
-    for pair in df["pair"].unique():
-        pair_df = df[df["pair"] == pair]
-        last_row = pair_df.iloc[-1]
+    confidence = int(np.clip(confidence, 55, 90))
 
-        # -------- ML SIGNAL --------
-        ml_signal = ml_predict_direction(last_row)
+    # =================================================
+    # 3️⃣ FINAL OUTPUT
+    # =================================================
+    if confidence < 60:
+        return {
+            "signal": "WAIT",
+            "confidence": confidence,
+            "reason": "Weak confirmation"
+        }
 
-        if ml_signal == 1:
-            signal = "BUY"
-            confidence = 0.60
-        elif ml_signal == -1:
-            signal = "SELL"
-            confidence = 0.60
-        else:
-            signal = "HOLD"
-            confidence = 0.40
-
-        # -------- SMC FILTER (FIXED) --------
-        if signal == "BUY":
-            if last_row["OrderBlock"] != 1:
-                signal = "HOLD"
-                confidence = 0.40
-
-        if signal == "SELL":
-            if last_row["OrderBlock"] != -1:
-                signal = "HOLD"
-                confidence = 0.40
-
-        # -------- LIVE CONFIRMATION --------
-        if timeframe is not None and signal != "HOLD":
-            live_trend = get_live_trend(pair, timeframe)
-
-            if signal == "BUY" and live_trend == "UP":
-                confidence += 0.25
-            elif signal == "SELL" and live_trend == "DOWN":
-                confidence += 0.25
-            else:
-                signal = "HOLD"
-                confidence = 0.40
-
-        confidence = min(round(confidence, 2), 0.99)
-
-        results.append({
-            "pair": pair,
-            "signal": signal,
-            "confidence": confidence
-        })
-
-    return results
+    return {
+        "signal": signal,
+        "confidence": confidence,
+        "reason": "Price action + momentum alignment"
+    }

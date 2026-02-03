@@ -1,93 +1,188 @@
 import streamlit as st
-import pandas as pd
-from step5_signal_logic import get_current_recommendations
-from live_data_mt5 import get_live_data
-from datetime import datetime, time
+import streamlit.components.v1 as components
+import os
+from datetime import datetime
 import pytz
-import MetaTrader5 as mt5
 
-# -------------------------------------------------
-# Page config
-# -------------------------------------------------
-st.set_page_config(page_title="PipDynamics", layout="wide")
-st.title("📈 PipDynamics – Forex Market Recommendations")
+from step5_signal_logic import get_recommendation_for_pair
+from live_data_mt5 import get_live_price
 
-# -------------------------------------------------
-# Market Status
-# -------------------------------------------------
-ist = pytz.timezone("Asia/Kolkata")
-now = datetime.now(ist).time()
-market_status = "🟢 OPEN" if time(5,30) <= now <= time(22,30) else "🔴 CLOSED"
-st.caption(f"Market Status: **{market_status}**")
+# =================================================
+# PAGE CONFIG
+# =================================================
+st.set_page_config(
+    page_title="PipDynamics",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
 
-# -------------------------------------------------
-# Load Past Data
-# -------------------------------------------------
-df = pd.read_csv("OP/final_trading_signals.csv")
+# =================================================
+# LOAD CSS
+# =================================================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+with open(os.path.join(BASE_DIR, "styles.css"), "r", encoding="utf-8") as f:
+    CSS = f.read()
 
-# -------------------------------------------------
-# Pair + Timeframe
-# -------------------------------------------------
+# =================================================
+# PAIRS
+# =================================================
+PAIRS = [
+    "EURUSD", "GBPUSD", "USDJPY",
+    "USDCHF", "USDCAD", "AUDUSD", "NZDUSD",
+    "EURGBP", "EURJPY", "EURCHF", "EURCAD",
+    "EURAUD", "EURNZD", "GBPJPY", "GBPCAD",
+    "GBPAUD", "AUDJPY", "AUDNZD"
+]
+
+# =================================================
+# MARKET STATUS
+# =================================================
+def is_market_open():
+    now_utc = datetime.utcnow()
+    wd = now_utc.weekday()
+    hr = now_utc.hour
+    if wd == 5:
+        return False
+    if wd == 6 and hr < 21:
+        return False
+    return True
+
+MARKET_OPEN = is_market_open()
+
+# =================================================
+# HEADER
+# =================================================
+market_text = (
+    "🟢 Market Open • Live data enabled"
+    if MARKET_OPEN
+    else "⚪ Market Closed • Last known price"
+)
+
+components.html(f"""
+<html>
+<head><style>{CSS}</style></head>
+<body>
+<div class="header">
+  <h1>📈 PipDynamics</h1>
+  <p>AI-powered Forex Market Recommendations</p>
+</div>
+<div class="market-open"><b>{market_text}</b></div>
+</body>
+</html>
+""", height=160)
+
+# =================================================
+# SESSION STATE (PAIR MEMORY)
+# =================================================
+if "pair_results" not in st.session_state:
+    st.session_state.pair_results = {}
+
+# =================================================
+# USER INPUT
+# =================================================
 col1, col2 = st.columns(2)
 
 with col1:
-    selected_pair = st.selectbox("Currency Pair", df["pair"].unique())
+    pair = st.selectbox("Currency Pair", PAIRS)
 
 with col2:
-    tf_label = st.selectbox("Timeframe", ["M5", "M15", "H1"])
+    timeframe = st.selectbox("Timeframe", ["M15", "H1"])
 
-TF_MAP = {
-    "M5": mt5.TIMEFRAME_M5,
-    "M15": mt5.TIMEFRAME_M15,
-    "H1": mt5.TIMEFRAME_H1
-}
-timeframe = TF_MAP[tf_label]
+# =================================================
+# GET RECOMMENDATION (PAIR SPECIFIC)
+# =================================================
+if pair not in st.session_state.pair_results:
+    st.session_state.pair_results[pair] = get_recommendation_for_pair(pair, timeframe)
 
-# -------------------------------------------------
-# Recommendations (PAST + LIVE inside logic)
-# -------------------------------------------------
-signals = get_current_recommendations(df)
-table = pd.DataFrame(signals)
-row = table[table["pair"] == selected_pair].iloc[0]
+result = st.session_state.pair_results[pair]
 
-# -------------------------------------------------
-# LIVE PRICE (MT5)
-# -------------------------------------------------
-symbol = selected_pair.replace("/", "")
+signal = result["signal"]
+confidence = float(result["confidence"])   # already 0–100
+reason = result.get("reason", "")
 
-try:
-    live_df = get_live_data(symbol, timeframe=timeframe, bars=50)
+# =================================================
+# STATUS LABEL (HONEST)
+# =================================================
+def strength_label(conf, sig):
+    if sig in ["BUY", "SELL"] and conf >= 80:
+        return "Strong"
+    if sig == "WAIT":
+        return "Forming"
+    if sig == "NO TRADE":
+        return "Unclear"
+    return "Weak"
 
-    if live_df.empty or len(live_df) < 2:
-        st.warning("Live price not available")
-        st.stop()
+# =================================================
+# LIVE PRICE
+# =================================================
+live_price, last_close = get_live_price(pair)
 
-except Exception as e:
-    st.error(f"MT5 Error: {e}")
-    st.stop()
+price_change = None
+if live_price and last_close:
+    price_change = ((live_price - last_close) / last_close) * 100
 
-last_close = live_df.iloc[-1]["close"]
-prev_close = live_df.iloc[-2]["close"]
-arrow = "⬆️" if last_close > prev_close else "⬇️"
+price_display = f"{live_price:.5f}" if live_price else "--.--"
 
-# -------------------------------------------------
-# Strength
-# -------------------------------------------------
-def strength(conf):
-    if conf >= 0.75:
-        return "🔥 Strong"
-    elif conf >= 0.50:
-        return "⚠️ Medium"
-    else:
-        return "💤 Weak"
+if price_change is not None:
+    arrow = "▲" if price_change >= 0 else "▼"
+    change_color = "#22c55e" if price_change >= 0 else "#ef4444"
+    change_display = f"{arrow} {abs(price_change):.2f}%"
+else:
+    change_color = "#94a3b8"
+    change_display = "--"
 
-# -------------------------------------------------
-# DISPLAY
-# -------------------------------------------------
-st.divider()
-st.subheader(f"📌 {selected_pair} Recommendation")
+price_status = "🟢 Live Price" if MARKET_OPEN else "⚪ Market Closed"
+price_class = "" if MARKET_OPEN else "closed"
 
-c1, c2, c3 = st.columns(3)
-c1.metric("Signal", row["signal"])
-c2.metric("Strength", strength(row["confidence"]))
-c3.metric("Live Price", f"{round(last_close,5)} {arrow}")
+# =================================================
+# TIME
+# =================================================
+ist = pytz.timezone("Asia/Kolkata")
+now = datetime.now(ist).strftime("%A | %d %b %Y | %I:%M:%S %p")
+
+# =================================================
+# MAIN UI
+# =================================================
+components.html(f"""
+<html>
+<head><style>{CSS}</style></head>
+<body>
+
+<div class="main-grid">
+
+  <div class="signal-card">
+    <div class="signal-text {signal.lower()}">{signal}</div>
+
+    <div class="signal-meta">
+      Status: <b>{strength_label(confidence, signal)}</b>
+    </div>
+
+    <div class="confidence-bar">
+      <div class="confidence-fill" style="width:{confidence}%"></div>
+    </div>
+
+    <div class="confidence-text">
+      Model Conviction: <b>{int(confidence)}%</b>
+    </div>
+
+    <div class="signal-reason">
+      {reason if reason else "Based on structure, momentum & volatility"}
+    </div>
+  </div>
+
+  <div class="price-card {price_class}">
+    <div class="price-pair">{pair}</div>
+    <div class="price-value">{price_display}</div>
+    <div class="price-change" style="color:{change_color}">
+      {change_display}
+    </div>
+    <div class="price-status">{price_status}</div>
+  </div>
+
+</div>
+
+<div class="timestamp">{now}</div>
+
+</body>
+</html>
+""", height=560, scrolling=False)
