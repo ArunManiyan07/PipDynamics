@@ -2,131 +2,179 @@ import pandas as pd
 import joblib
 import os
 import numpy as np
+import logging
 
 from live_data_mt5 import get_live_data
 
+
 # =================================================
-# PATHS
+# LOGGING
+# =================================================
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("signal_engine")
+
+
+# =================================================
+# LOAD MODEL + FEATURES
 # =================================================
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODEL_PATH = os.path.join(BASE_DIR, "models", "rf_h1_directional_model.pkl")
+
+MODEL_PATH = os.path.join(BASE_DIR, "models", "rf_directional_model.pkl")
+FEATURE_PATH = os.path.join(BASE_DIR, "models", "model_features.pkl")
+
+try:
+    ml_model = joblib.load(MODEL_PATH)
+    model_features = joblib.load(FEATURE_PATH)
+except Exception as e:
+    raise RuntimeError(f"Model loading failed: {str(e)}")
+
 
 # =================================================
-# LOAD MODEL
+# FEATURE ENGINEERING
 # =================================================
-ml_model = joblib.load(MODEL_PATH)
+def generate_features(df: pd.DataFrame) -> pd.DataFrame:
 
-# =================================================
-# INDICATORS
-# =================================================
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    df.columns = df.columns.str.lower()
+
+    required_cols = {"open", "high", "low", "close"}
+    if not required_cols.issubset(df.columns):
+        raise ValueError("Missing OHLC columns in live data")
 
     # EMA
-    df["EMA"] = df["close"].ewm(span=20, adjust=False).mean()
+    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
+    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
+    df["ema_diff"] = df["ema20"] - df["ema50"]
 
     # RSI
     delta = df["close"].diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-
     avg_gain = gain.rolling(14).mean()
     avg_loss = loss.rolling(14).mean()
-
     rs = avg_gain / (avg_loss + 1e-9)
-    df["RSI"] = 100 - (100 / (1 + rs))
+    df["rsi"] = 100 - (100 / (1 + rs))
+
+    # ATR
+    high_low = df["high"] - df["low"]
+    high_close = abs(df["high"] - df["close"].shift())
+    low_close = abs(df["low"] - df["close"].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df["atr"] = tr.rolling(14).mean()
+
+    df = df.dropna().reset_index(drop=True)
 
     return df
 
+
 # =================================================
-# ML PROBABILITY (CONFIDENCE ONLY)
+# MAIN SIGNAL FUNCTION
 # =================================================
-def get_ml_bias(row):
-    X = pd.DataFrame([{
-        "EMA": row["EMA"],
-        "RSI": row["RSI"]
-    }])
+def get_recommendation_for_pair(pair: str, timeframe: str = "H1"):
 
     try:
+        df = get_live_data(pair, timeframe=timeframe, bars=400)
+
+        if df is None or len(df) < 60:
+            return _hold_response("Insufficient live data")
+
+        df = generate_features(df)
+
+        if df.empty:
+            return _hold_response("Feature generation failed")
+
+        last = df.iloc[-1]
+
+        # Prepare model input
+        X = pd.DataFrame(
+            [[last.get(f, 0) for f in model_features]],
+            columns=model_features
+        )
+
         probs = ml_model.predict_proba(X)[0]
-        buy_prob = float(probs[1])
-        sell_prob = float(probs[0])
-        return buy_prob - sell_prob   # bias only
-    except Exception:
-        return 0.0
+        classes = ml_model.classes_
 
-# =================================================
-# STRONGER TREND (PRICE ACTION)
-# =================================================
-def get_trend(df: pd.DataFrame) -> str:
-    if len(df) < 50:
-        return "FLAT"
+        prob_dict = dict(zip(classes, probs))
 
-    recent_high = df["high"].iloc[-20:].max()
-    recent_low = df["low"].iloc[-20:].min()
+        buy_prob = float(prob_dict.get(1, 0))
+        sell_prob = float(prob_dict.get(-1, 0))
 
-    if df["close"].iloc[-1] > recent_high * 0.998:
-        return "UP"
-    if df["close"].iloc[-1] < recent_low * 1.002:
-        return "DOWN"
-    return "FLAT"
+        logger.info(f"{pair} → BUY:{buy_prob:.3f} SELL:{sell_prob:.3f}")
 
-# =================================================
-# 🔥 FINAL RECOMMENDATION ENGINE (GUARANTEED DISTRIBUTION)
-# =================================================
-def get_recommendation_for_pair(pair: str, timeframe: str = "M15"):
+        # =================================================
+        # DECISION LOGIC (BALANCED + STABLE)
+        # =================================================
 
-    df = get_live_data(pair, timeframe=timeframe, bars=300)
-    if df is None or len(df) < 150:
-        return {"signal": "NO DATA", "confidence": 0, "reason": "Insufficient data"}
+        edge = abs(buy_prob - sell_prob)
 
-    df = add_indicators(df)
-    last = df.iloc[-1]
+        # If too close → market indecision
+        if edge < 0.025:
+            return _hold_response("Market indecision (probabilities too close)")
 
-    trend = get_trend(df)
-    rsi = last["RSI"]
-    ml_bias = get_ml_bias(last)
+        # Determine direction
+        if buy_prob > sell_prob:
+            direction = "BUY"
+            confidence = buy_prob
+        else:
+            direction = "SELL"
+            confidence = sell_prob
 
-    # =================================================
-    # 1️⃣ RULE-BASED DIRECTION (PRIMARY)
-    # =================================================
-    if trend == "UP" and rsi < 70:
-        signal = "BUY"
-        confidence = 65 + (70 - rsi) * 0.5
-    elif trend == "DOWN" and rsi > 30:
-        signal = "SELL"
-        confidence = 65 + (rsi - 30) * 0.5
-    else:
+        confidence_pct = round(confidence * 100, 2)
+
+        # Strength grading
+        if confidence >= 0.70:
+            strength = "Strong"
+        elif confidence >= 0.60:
+            strength = "Moderate"
+        else:
+            strength = "Weak"
+
+        # =================================================
+        # TRADE LEVELS USING ATR
+        # =================================================
+        price = float(last["close"])
+        atr = float(last["atr"])
+
+        risk_multiplier = 1.0
+        reward_multiplier = 2.0
+
+        if direction == "BUY":
+            sl = round(price - (atr * risk_multiplier), 5)
+            tp = round(price + (atr * reward_multiplier), 5)
+        else:
+            sl = round(price + (atr * risk_multiplier), 5)
+            tp = round(price - (atr * reward_multiplier), 5)
+
         return {
-            "signal": "HOLD",
-            "confidence": 50,
-            "reason": "Market ranging / no structure"
+            "signal": direction,
+            "strength": strength,
+            "confidence": confidence_pct,
+            "entry": round(price, 5),
+            "sl": sl,
+            "tp": tp,
+            "rr": "1:2",
+            "reasons": [
+                f"{strength} {direction} probability edge",
+                f"Probability gap: {round(edge*100,2)}%"
+            ]
         }
 
-    # =================================================
-    # 2️⃣ ML CONFIDENCE ADJUSTMENT (NOT DIRECTION)
-    # =================================================
-    if signal == "BUY" and ml_bias > 0:
-        confidence += 8
-    elif signal == "SELL" and ml_bias < 0:
-        confidence += 8
-    else:
-        confidence -= 5
+    except Exception as e:
+        logger.error(f"Signal engine failure: {str(e)}")
+        return _hold_response("Signal engine failure")
 
-    confidence = int(np.clip(confidence, 55, 90))
 
-    # =================================================
-    # 3️⃣ FINAL OUTPUT
-    # =================================================
-    if confidence < 60:
-        return {
-            "signal": "WAIT",
-            "confidence": confidence,
-            "reason": "Weak confirmation"
-        }
-
+# =================================================
+# HOLD RESPONSE
+# =================================================
+def _hold_response(reason: str):
     return {
-        "signal": signal,
-        "confidence": confidence,
-        "reason": "Price action + momentum alignment"
+        "signal": "WAIT",
+        "strength": "Neutral",
+        "confidence": 0,
+        "entry": None,
+        "sl": None,
+        "tp": None,
+        "rr": None,
+        "reasons": [reason]
     }
